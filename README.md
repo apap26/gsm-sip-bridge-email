@@ -40,6 +40,20 @@ chmod 600 .env
 `SMTP_STARTTLS=false`. Для STARTTLS обычно используются порт `587`,
 `SMTP_STARTTLS=true` и `SMTP_SSL=false`.
 
+До запуска выполните preflight. Он проверяет настройки, read-only доступ к
+рабочей SMS-базе, возможность записи в отдельный state volume и соединение с
+SMTP (включая TLS и авторизацию), но не отправляет письмо:
+
+```bash
+cd ~/gsm-sip-bridge/docker
+docker compose build gsm-sip-bridge-email
+docker compose run --rm --no-deps \
+  --entrypoint python gsm-sip-bridge-email /app/preflight.py
+```
+
+Успешный результат содержит `"status": "ok"`. При ошибке исправьте `.env` и
+повторите preflight; не запускайте постоянный контейнер до успешной проверки.
+
 ## Запуск
 
 Обычный стек:

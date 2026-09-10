@@ -6,7 +6,7 @@ RUN addgroup -S forwarder \
     && chown forwarder:forwarder /data
 
 WORKDIR /app
-COPY --chown=forwarder:forwarder forwarder.py healthcheck.py ./
+COPY --chown=forwarder:forwarder forwarder.py healthcheck.py preflight.py ./
 
 USER forwarder
 VOLUME ["/data"]
