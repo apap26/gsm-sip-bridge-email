@@ -45,12 +45,13 @@ class ForwarderTest(unittest.TestCase):
         self.source_path = root / "store.db"
         with sqlite3.connect(self.source_path) as db:
             db.execute(
-                "CREATE TABLE sms (id INTEGER PRIMARY KEY, sender TEXT NOT NULL, "
+                "CREATE TABLE sms (id INTEGER PRIMARY KEY, module_id TEXT NOT NULL, "
+                "sender TEXT NOT NULL, "
                 "body TEXT NOT NULL, received_at TEXT NOT NULL, "
                 "forwarding_status TEXT NOT NULL)"
             )
             db.execute(
-                "INSERT INTO sms VALUES (1, '+123', 'Привет мир', "
+                "INSERT INTO sms VALUES (1, 'pcsc0', '+123', 'Привет мир', "
                 "'2026-09-10T10:00:00Z', 'pending')"
             )
         self.config = Config(
@@ -86,6 +87,7 @@ class ForwarderTest(unittest.TestCase):
             self.assertEqual(len(FakeSmtp.messages), 1)
             message = FakeSmtp.messages[0]
             self.assertEqual(message["Subject"], "SMS from +123")
+            self.assertIn("Recipient module: pcsc0", message.get_content())
             self.assertIn("Привет мир", message.get_content())
             self.assertTrue(Path(self.config.health_file).exists())
         finally:

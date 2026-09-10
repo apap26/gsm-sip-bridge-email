@@ -21,7 +21,7 @@ from urllib.parse import quote
 
 
 LOG = logging.getLogger("gsm_sip_bridge_email")
-REQUIRED_SMS_COLUMNS = {"id", "sender", "body", "received_at"}
+REQUIRED_SMS_COLUMNS = {"id", "module_id", "sender", "body", "received_at"}
 
 
 class JsonFormatter(logging.Formatter):
@@ -129,6 +129,7 @@ class Config:
 @dataclass(frozen=True)
 class Sms:
     id: int
+    module_id: str
     sender: str
     body: str
     received_at: str
@@ -193,7 +194,10 @@ class Forwarder:
         message["To"] = ", ".join(self.config.smtp_to)
         message["Message-ID"] = message_id
         message.set_content(
-            f"Sender: {sms.sender}\nReceived at: {sms.received_at}\n\n{sms.body}\n",
+            f"Sender: {sms.sender}\n"
+            f"Recipient module: {sms.module_id}\n"
+            f"Received at: {sms.received_at}\n\n"
+            f"{sms.body}\n",
             charset="utf-8",
         )
 
@@ -230,7 +234,7 @@ class Forwarder:
         with closing(self.open_source()) as source:
             while not self.stopping:
                 rows = source.execute(
-                    "SELECT id, sender, body, received_at FROM sms "
+                    "SELECT id, module_id, sender, body, received_at FROM sms "
                     "WHERE id > ? ORDER BY id ASC LIMIT ?",
                     (last_id, self.config.batch_size),
                 ).fetchall()
