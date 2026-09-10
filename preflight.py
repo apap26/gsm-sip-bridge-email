@@ -31,6 +31,15 @@ def check_smtp(config: Config) -> None:
         status, _message = client.noop()
         if status != 250:
             raise RuntimeError(f"SMTP NOOP returned status {status}")
+        status, response = client.mail(config.smtp_from)
+        client.rset()
+        if status != 250:
+            detail = (
+                response.decode(errors="replace")
+                if isinstance(response, bytes)
+                else response
+            )
+            raise RuntimeError(f"SMTP rejected SMTP_FROM with status {status}: {detail}")
 
 
 def main() -> int:
@@ -50,7 +59,7 @@ def main() -> int:
                     "source_database": "read-only",
                     "sms_count": sms_count,
                     "state_database": "writable",
-                    "smtp": "connected and authenticated",
+                    "smtp": "connected, authenticated, and sender accepted",
                 }
             )
         )
