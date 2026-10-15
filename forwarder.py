@@ -13,7 +13,7 @@ import ssl
 import sys
 import time
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -75,6 +75,7 @@ class Config:
     batch_size: int
     db_busy_timeout_seconds: float
     log_level: str
+    multipart_wait_seconds: float = 180
 
     @classmethod
     def from_env(cls) -> Config:
@@ -118,11 +119,14 @@ class Config:
             batch_size=int(os.getenv("BATCH_SIZE", "100")),
             db_busy_timeout_seconds=float(os.getenv("DB_BUSY_TIMEOUT_SECONDS", "5")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            multipart_wait_seconds=float(os.getenv("MULTIPART_WAIT_SECONDS", "180")),
         )
         if config.smtp_port < 1 or config.smtp_port > 65535:
             raise ValueError("SMTP_PORT must be between 1 and 65535")
         if config.poll_interval_seconds <= 0 or config.batch_size <= 0:
             raise ValueError("POLL_INTERVAL_SECONDS and BATCH_SIZE must be positive")
+        if not 0 < config.multipart_wait_seconds < float("inf"):
+            raise ValueError("MULTIPART_WAIT_SECONDS must be finite and positive")
         return config
 
 
@@ -133,6 +137,82 @@ class Sms:
     sender: str
     body: str
     received_at: str
+    concat_ref: int | None = None
+    concat_total: int | None = None
+    concat_sequence: int | None = None
+    transport: str = ""
+
+
+def received_time(sms: Sms) -> datetime:
+    value = datetime.fromisoformat(sms.received_at.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        raise ValueError("multipart received_at must include a timezone")
+    return value
+
+
+def multipart_key(sms: Sms) -> tuple | None:
+    if (
+        type(sms.concat_ref) is int and 0 <= sms.concat_ref <= 65535
+        and type(sms.concat_total) is int and 2 <= sms.concat_total <= 255
+        and type(sms.concat_sequence) is int
+        and 1 <= sms.concat_sequence <= sms.concat_total
+    ):
+        try:
+            received_time(sms)
+        except ValueError:
+            return None
+        return (sms.module_id, sms.sender, sms.transport, sms.concat_ref, sms.concat_total)
+    return None
+
+
+def assemble_messages(messages: list[Sms], now: datetime, wait: float):
+    """Yield (email, source IDs); pending parts stay in the read-only source.
+
+    Never infer concatenation from sender, text length, or '[1/2]' text.
+    Reference reuse is separated by a bounded arrival window. Conflicting
+    duplicate sequence numbers are not combined, even after the deadline.
+    """
+    groups: dict[tuple, list[list[Sms]]] = {}
+    for sms in messages:
+        key = multipart_key(sms)
+        if key is None:
+            yield sms, [sms.id]
+            continue
+        windows = groups.setdefault(key, [])
+        group = next((g for g in windows if abs(
+            (received_time(sms) - received_time(g[0])).total_seconds()
+        ) <= wait), None)
+        if group is None:
+            windows.append([sms])
+        else:
+            group.append(sms)
+    for windows in groups.values():
+        for parts in windows:
+            ordered: dict[int, Sms] = {}
+            conflict = False
+            for part in parts:
+                previous = ordered.get(part.concat_sequence)
+                if previous and previous.body != part.body:
+                    conflict = True
+                ordered[part.concat_sequence] = part
+            first = min(parts, key=lambda s: s.id)
+            expired = (now - min(received_time(s) for s in parts)).total_seconds() >= wait
+            complete = len(ordered) == first.concat_total
+            if conflict:
+                if expired:
+                    for part in parts:
+                        yield replace(part, body=(
+                            f"[Unassembled SMS: conflicting parts; "
+                            f"part {part.concat_sequence}/{part.concat_total}]\n{part.body}"
+                        )), [part.id]
+            elif complete or expired:
+                body = "".join(ordered[n].body for n in sorted(ordered))
+                if not complete:
+                    missing = sorted(set(range(1, first.concat_total + 1)) - ordered.keys())
+                    body = f"[Incomplete SMS; missing parts: {missing}]\n" + "\n".join(
+                        f"[{n}/{first.concat_total}] {ordered[n].body}" for n in sorted(ordered)
+                    )
+                yield replace(first, body=body), [p.id for p in parts]
 
 
 class Forwarder:
@@ -221,20 +301,28 @@ class Forwarder:
         return message_id
 
     def mark_sent(self, sms_id: int, message_id: str) -> None:
+        self.mark_many_sent([sms_id], message_id)
+
+    def mark_many_sent(self, sms_ids: list[int], message_id: str) -> None:
         with self.state:
-            self.state.execute(
+            self.state.executemany(
                 "INSERT OR IGNORE INTO sent_sms (sms_id, sent_at, message_id) "
                 "VALUES (?, ?, ?)",
-                (sms_id, datetime.now(UTC).isoformat(), message_id),
+                [(sms_id, datetime.now(UTC).isoformat(), message_id) for sms_id in sms_ids],
             )
 
     def poll_once(self) -> tuple[int, int]:
         sent = failed = 0
         last_id = 0
+        pending = []
         with closing(self.open_source()) as source:
+            columns = {row[1] for row in source.execute("PRAGMA table_info(sms)")}
+            metadata = ("concat_ref", "concat_total", "concat_sequence")
+            extra = ", " + ", ".join(metadata) if set(metadata) <= columns else ", NULL, NULL, NULL"
+            extra += ", COALESCE(transport, '')" if "transport" in columns else ", ''"
             while not self.stopping:
                 rows = source.execute(
-                    "SELECT id, module_id, sender, body, received_at FROM sms "
+                    "SELECT id, module_id, sender, body, received_at" + extra + " FROM sms "
                     "WHERE id > ? ORDER BY id ASC LIMIT ?",
                     (last_id, self.config.batch_size),
                 ).fetchall()
@@ -245,26 +333,32 @@ class Forwarder:
                     last_id = sms.id
                     if self.already_sent(sms.id):
                         continue
-                    try:
-                        message_id = self.send(sms)
-                        self.mark_sent(sms.id, message_id)
-                        sent += 1
-                        LOG.info(
-                            "SMS delivered",
-                            extra={"sms_id": sms.id, "sender": sms.sender},
-                        )
-                    except Exception as error:
-                        failed += 1
-                        LOG.error(
-                            "SMTP delivery failed; SMS will be retried",
-                            extra={
-                                "sms_id": sms.id,
-                                "sender": sms.sender,
-                                "error": f"{type(error).__name__}: {error}",
-                            },
-                        )
+                    pending.append(sms)
                 if len(rows) < self.config.batch_size:
                     break
+            for sms, sms_ids in assemble_messages(
+                pending, datetime.now(UTC), self.config.multipart_wait_seconds
+            ):
+                if self.stopping:
+                    break
+                try:
+                    message_id = self.send(sms)
+                    self.mark_many_sent(sms_ids, message_id)
+                    sent += 1
+                    LOG.info(
+                        "SMS delivered",
+                        extra={"sms_id": sms.id, "sender": sms.sender},
+                    )
+                except Exception as error:
+                    failed += 1
+                    LOG.error(
+                        "SMTP delivery failed; SMS will be retried",
+                        extra={
+                            "sms_id": sms.id,
+                            "sender": sms.sender,
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                    )
         Path(self.config.health_file).touch()
         return sent, failed
 
